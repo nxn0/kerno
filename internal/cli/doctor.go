@@ -6,6 +6,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/optiqor/kerno/internal/ai"
+	"github.com/optiqor/kerno/internal/bpf"
 	"github.com/optiqor/kerno/internal/collector"
 	"github.com/optiqor/kerno/internal/config"
 	"github.com/optiqor/kerno/internal/doctor"
@@ -142,11 +144,22 @@ func runDoctor(ctx context.Context, opts doctorOpts) error {
 		}
 	}
 
-	// Create collector registry.
-	registry := collector.NewRegistry(logger)
+	// Build the eBPF loader set + collector registry. Loader failures are
+	// non-fatal — we degrade gracefully and surface the gap in the report.
+	registry, closers, loadedCount, totalCount := buildCollectors(logger)
+	defer func() {
+		for _, c := range closers {
+			c()
+		}
+	}()
 
-	// TODO(phase-2): Register live collectors here once they are implemented.
-	// For now, the registry produces empty signals → "System Healthy" report.
+	if loadedCount == 0 && totalCount > 0 {
+		// Nothing loaded. Common causes: not root, no BTF, kernel too old.
+		// Still run the cycle so the renderer can show the empty/healthy
+		// state with the program count footer — useful diagnostic itself.
+		logger.Warn("no eBPF programs loaded; report will reflect zero signals",
+			"hint", "check root privileges, /sys/kernel/btf/vmlinux, and kernel >= 5.8")
+	}
 
 	// Run the diagnostic loop (once, or continuous).
 	for {
@@ -167,6 +180,121 @@ func runDoctor(ctx context.Context, opts doctorOpts) error {
 	}
 
 	return nil
+}
+
+// buildCollectors loads all enabled eBPF programs and registers a
+// matching live collector for each. Loaders that fail to load are
+// skipped (graceful degradation). Returns the registry, a list of
+// cleanup closures (idempotent), and counters for the report footer.
+func buildCollectors(logger *slog.Logger) (*collector.Registry, []func(), int, int) {
+	registry := collector.NewRegistry(logger)
+	var closers []func()
+
+	type loaderRegistration struct {
+		name    string
+		enabled bool
+		// build creates the loader, calls Load() on it, and returns a
+		// Collector ready to be registered. On Load() failure, returns
+		// (nil, nil, error) so the caller can log + skip.
+		build func() (collector.Collector, io.Closer, error)
+	}
+
+	registrations := []loaderRegistration{
+		{
+			name:    "syscall_latency",
+			enabled: cfg.Collectors.SyscallLatency,
+			build: func() (collector.Collector, io.Closer, error) {
+				l := bpf.NewSyscallLatencyLoader(logger)
+				closer, err := l.Load()
+				if err != nil {
+					return nil, nil, err
+				}
+				return collector.NewSyscallCollector(logger, l), closer, nil
+			},
+		},
+		{
+			name:    "tcp_monitor",
+			enabled: cfg.Collectors.TCPMonitor,
+			build: func() (collector.Collector, io.Closer, error) {
+				l := bpf.NewTCPMonitorLoader(logger)
+				closer, err := l.Load()
+				if err != nil {
+					return nil, nil, err
+				}
+				return collector.NewTCPCollector(logger, l), closer, nil
+			},
+		},
+		{
+			name:    "oom_track",
+			enabled: cfg.Collectors.OOMTrack,
+			build: func() (collector.Collector, io.Closer, error) {
+				l := bpf.NewOOMTrackLoader(logger)
+				closer, err := l.Load()
+				if err != nil {
+					return nil, nil, err
+				}
+				return collector.NewOOMCollector(logger, l), closer, nil
+			},
+		},
+		{
+			name:    "disk_io",
+			enabled: cfg.Collectors.DiskIO,
+			build: func() (collector.Collector, io.Closer, error) {
+				l := bpf.NewDiskIOLoader(logger)
+				closer, err := l.Load()
+				if err != nil {
+					return nil, nil, err
+				}
+				return collector.NewDiskIOCollector(logger, l), closer, nil
+			},
+		},
+		{
+			name:    "sched_delay",
+			enabled: cfg.Collectors.SchedDelay,
+			build: func() (collector.Collector, io.Closer, error) {
+				l := bpf.NewSchedDelayLoader(logger)
+				closer, err := l.Load()
+				if err != nil {
+					return nil, nil, err
+				}
+				return collector.NewSchedCollector(logger, l), closer, nil
+			},
+		},
+		{
+			name:    "fd_track",
+			enabled: cfg.Collectors.FDTrack,
+			build: func() (collector.Collector, io.Closer, error) {
+				l := bpf.NewFDTrackLoader(logger)
+				closer, err := l.Load()
+				if err != nil {
+					return nil, nil, err
+				}
+				return collector.NewFDCollector(logger, l), closer, nil
+			},
+		},
+	}
+
+	loaded, total := 0, 0
+	for _, r := range registrations {
+		if !r.enabled {
+			continue
+		}
+		total++
+		coll, closer, err := r.build()
+		if err != nil {
+			logger.Warn("failed to load eBPF program; collector disabled",
+				"program", r.name, "error", err)
+			continue
+		}
+		closers = append(closers, func() { _ = closer.Close() })
+		if err := registry.Register(coll); err != nil {
+			logger.Warn("failed to register collector", "name", coll.Name(), "error", err)
+			continue
+		}
+		loaded++
+	}
+
+	return registry, closers, loaded, total
 }
 
 // buildAnalyzer constructs the AI analyzer from configuration.
@@ -229,9 +357,19 @@ func runDiagnosticCycle(
 		"ai", opts.aiEnabled,
 	)
 
-	// Phase 1: Collect signals for the configured duration.
+	// Phase 1: Start collectors and let them consume events for the
+	// configured duration. Each collector runs its own goroutine driven
+	// by the loader's ringbuf; we just bound the lifetime here.
 	collectCtx, cancel := context.WithTimeout(ctx, opts.duration)
 	defer cancel()
+
+	if err := registry.StartAll(collectCtx); err != nil {
+		// A collector failing to start is non-fatal — log and continue.
+		// Snapshot() on an unstarted collector still returns a zero-value
+		// snapshot, which the rule engine handles cleanly.
+		logger.Warn("one or more collectors failed to start", "error", err)
+	}
+	defer registry.StopAll()
 
 	// Show progress to user (stderr so it doesn't pollute JSON output).
 	if opts.output != "json" {
