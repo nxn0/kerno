@@ -32,9 +32,17 @@ func (CPUScenario) Description() string {
 func (CPUScenario) PairedRule() string { return "scheduler_contention" }
 
 // Run implements Scenario.
+//
+// Each worker calls runtime.LockOSThread() so it runs on a dedicated OS
+// thread. With more locked threads than host CPUs, the OS scheduler
+// (not Go's M:N runtime) is forced to queue ready threads — which is
+// precisely the signal kerno's scheduler_contention rule keys on.
+// Without this pinning, GOMAXPROCS caps the number of Ms running tight
+// loops at NumCPU and the kernel runqueue stays shallow.
 func (s CPUScenario) Run(ctx context.Context, opts Options) error {
-	workers := workersFromIntensity(opts.Intensity, runtime.NumCPU())
-	fmt.Fprintf(opts.Out, "    spawning %d CPU-saturation workers\n", workers)
+	workers := cpuWorkersFromIntensity(opts.Intensity, runtime.NumCPU())
+	fmt.Fprintf(opts.Out, "    spawning %d CPU-pinned workers (NumCPU=%d)\n",
+		workers, runtime.NumCPU())
 
 	// sink is updated atomically across all workers so the compiler
 	// can't prove the loop body is dead.
@@ -45,6 +53,7 @@ func (s CPUScenario) Run(ctx context.Context, opts Options) error {
 		wg.Add(1)
 		go func(seed int64) {
 			defer wg.Done()
+			runtime.LockOSThread()
 			// math/rand is fine here — we only need pseudo-random
 			// floats to keep the optimizer from removing the loop.
 			r := rand.New(rand.NewSource(seed)) //nolint:gosec
@@ -60,4 +69,20 @@ func (s CPUScenario) Run(ctx context.Context, opts Options) error {
 	wg.Wait()
 	_ = sink.Load() // observe the running total to keep it live
 	return nil
+}
+
+// cpuWorkersFromIntensity oversubscribes CPUs heavily so the OS
+// scheduler genuinely queues threads.
+func cpuWorkersFromIntensity(intensity Intensity, ncpu int) int {
+	if ncpu <= 0 {
+		ncpu = 1
+	}
+	switch intensity {
+	case IntensityLow:
+		return ncpu * 2
+	case IntensityHigh:
+		return ncpu * 8
+	default:
+		return ncpu * 4
+	}
 }
