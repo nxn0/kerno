@@ -377,8 +377,11 @@ func evalOOMImminent(s *collector.Signals, t config.DoctorThresholds) []Finding 
 	}
 
 	threshold := t.OOMMemoryPct
-	if threshold == 0 {
-		threshold = 90.0
+	// Negative threshold disables the rule. Zero is treated literally
+	// (fires on any non-zero usage) — useful for tests; default config
+	// supplies 90.0 for production.
+	if threshold < 0 {
+		return nil
 	}
 
 	if s.Memory.UsedPct < threshold {
