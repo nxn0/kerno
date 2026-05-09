@@ -182,6 +182,13 @@ func runDoctor(ctx context.Context, opts doctorOpts) error {
 	return nil
 }
 
+// noopCloser satisfies io.Closer with a no-op Close. Used by collectors
+// that don't load any eBPF program (e.g. the procfs-based memory
+// collector) so the registration table can stay uniform.
+type noopCloser struct{}
+
+func (noopCloser) Close() error { return nil }
+
 // buildCollectors loads all enabled eBPF programs and registers a
 // matching live collector for each. Loaders that fail to load are
 // skipped (graceful degradation). Returns the registry, a list of
@@ -270,6 +277,16 @@ func buildCollectors(logger *slog.Logger) (*collector.Registry, []func(), int, i
 					return nil, nil, err
 				}
 				return collector.NewFDCollector(logger, l), closer, nil
+			},
+		},
+		{
+			// Memory collector polls /proc/meminfo — it doesn't load
+			// any eBPF program, so the build closure returns a no-op
+			// io.Closer.
+			name:    "memory",
+			enabled: true,
+			build: func() (collector.Collector, io.Closer, error) {
+				return collector.NewMemoryCollector(logger, 0), noopCloser{}, nil
 			},
 		},
 	}

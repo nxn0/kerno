@@ -140,6 +140,8 @@ func (r *Registry) Signals(duration time.Duration) *Signals {
 			s.Sched = v
 		case *FDSnapshot:
 			s.FD = v
+		case *MemorySnapshot:
+			s.Memory = v
 		}
 	}
 
